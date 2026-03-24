@@ -164,6 +164,196 @@ func TestVisitPayloads_NestedParent(t *testing.T) {
 	require.IsType(t, &command.StartChildWorkflowExecutionCommandAttributes{}, inputParent)
 }
 
+func TestVisitPayloads_MapPayloadVisitor(t *testing.T) {
+	root := &workflowservice.StartWorkflowExecutionRequest{
+		Input: &common.Payloads{
+			Payloads: []*common.Payload{{Data: []byte("input-value")}},
+		},
+		Memo: &common.Memo{
+			Fields: map[string]*common.Payload{
+				"key1": {Data: []byte("memo-val-1")},
+				"key2": {Data: []byte("memo-val-2")},
+			},
+		},
+	}
+
+	var mapVisitorCalled bool
+	var visitorCalledForMemo bool
+	err := VisitPayloads(context.Background(), root, VisitPayloadsOptions{
+		Visitor: func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+			for _, pl := range p {
+				if strings.HasPrefix(string(pl.Data), "memo-val") {
+					visitorCalledForMemo = true
+				}
+			}
+			return p, nil
+		},
+		MapPayloadVisitor: func(ctx *VisitPayloadsContext, fields map[string]*common.Payload) error {
+			mapVisitorCalled = true
+			require.False(t, ctx.SinglePayloadRequired)
+			require.IsType(t, &common.Memo{}, ctx.Parent)
+			require.Len(t, fields, 2)
+			require.Equal(t, []byte("memo-val-1"), fields["key1"].Data)
+			require.Equal(t, []byte("memo-val-2"), fields["key2"].Data)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, mapVisitorCalled, "MapPayloadVisitor should have been called")
+	require.False(t, visitorCalledForMemo, "Visitor should not be called for memo payloads when MapPayloadVisitor is set")
+}
+
+func TestVisitPayloads_MapPayloadVisitorModifiesFields(t *testing.T) {
+	root := &workflowservice.StartWorkflowExecutionRequest{
+		Memo: &common.Memo{
+			Fields: map[string]*common.Payload{
+				"key1": {Data: []byte("val-1")},
+			},
+		},
+	}
+
+	err := VisitPayloads(context.Background(), root, VisitPayloadsOptions{
+		Visitor: func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+			return p, nil
+		},
+		MapPayloadVisitor: func(ctx *VisitPayloadsContext, fields map[string]*common.Payload) error {
+			require.False(t, ctx.SinglePayloadRequired)
+			fields["key1"] = &common.Payload{Data: []byte("modified-1")}
+			fields["new-key"] = &common.Payload{Data: []byte("new-val")}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, root.Memo.Fields, 2)
+	require.Equal(t, []byte("modified-1"), root.Memo.Fields["key1"].Data)
+	require.Equal(t, []byte("new-val"), root.Memo.Fields["new-key"].Data)
+}
+
+func TestVisitPayloads_MapPayloadVisitorNilFallsBack(t *testing.T) {
+	root := &workflowservice.StartWorkflowExecutionRequest{
+		Memo: &common.Memo{
+			Fields: map[string]*common.Payload{
+				"key1": {Data: []byte("memo-val")},
+			},
+		},
+	}
+
+	var visitorCalled bool
+	err := VisitPayloads(context.Background(), root, VisitPayloadsOptions{
+		Visitor: func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+			visitorCalled = true
+			require.True(t, ctx.SinglePayloadRequired)
+			return p, nil
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, visitorCalled, "Visitor should be called for memo payloads when MapPayloadVisitor is nil")
+}
+
+func TestVisitPayloads_MapPayloadVisitorFiresForHeader(t *testing.T) {
+	root := &workflowservice.StartWorkflowExecutionRequest{
+		Header: &common.Header{
+			Fields: map[string]*common.Payload{
+				"header-key": {Data: []byte("header-val")},
+			},
+		},
+		Memo: &common.Memo{
+			Fields: map[string]*common.Payload{
+				"memo-key": {Data: []byte("memo-val")},
+			},
+		},
+	}
+
+	var parents []proto.Message
+	err := VisitPayloads(context.Background(), root, VisitPayloadsOptions{
+		Visitor: func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+			return p, nil
+		},
+		MapPayloadVisitor: func(ctx *VisitPayloadsContext, fields map[string]*common.Payload) error {
+			require.False(t, ctx.SinglePayloadRequired)
+			parents = append(parents, proto.Clone(ctx.Parent))
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, parents, 2)
+	parentTypes := map[string]bool{}
+	for _, p := range parents {
+		switch p.(type) {
+		case *common.Memo:
+			parentTypes["Memo"] = true
+		case *common.Header:
+			parentTypes["Header"] = true
+		}
+	}
+	require.True(t, parentTypes["Memo"], "MapPayloadVisitor should fire for Memo")
+	require.True(t, parentTypes["Header"], "MapPayloadVisitor should fire for Header")
+}
+
+func TestVisitPayloads_MapPayloadVisitorError(t *testing.T) {
+	root := &workflowservice.StartWorkflowExecutionRequest{
+		Memo: &common.Memo{
+			Fields: map[string]*common.Payload{
+				"key1": {Data: []byte("val")},
+			},
+		},
+	}
+
+	err := VisitPayloads(context.Background(), root, VisitPayloadsOptions{
+		Visitor: func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+			return p, nil
+		},
+		MapPayloadVisitor: func(ctx *VisitPayloadsContext, fields map[string]*common.Payload) error {
+			return fmt.Errorf("encountered a memo that is too large")
+		},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "encountered a memo that is too large")
+}
+
+func TestVisitPayloads_MapPayloadVisitorDefaultEquivalence(t *testing.T) {
+	makeRoot := func() *workflowservice.StartWorkflowExecutionRequest {
+		return &workflowservice.StartWorkflowExecutionRequest{
+			Memo: &common.Memo{
+				Fields: map[string]*common.Payload{
+					"key1": {Data: []byte("val-1")},
+					"key2": {Data: []byte("val-2")},
+				},
+			},
+		}
+	}
+
+	visitor := func(ctx *VisitPayloadsContext, p []*common.Payload) ([]*common.Payload, error) {
+		return []*common.Payload{{Data: append(p[0].Data, []byte("-visited")...)}}, nil
+	}
+
+	// Visit without MapPayloadVisitor (uses default implicitly)
+	rootWithout := makeRoot()
+	err := VisitPayloads(context.Background(), rootWithout, VisitPayloadsOptions{
+		Visitor: visitor,
+	})
+	require.NoError(t, err)
+
+	// Visit with a user-written MapPayloadVisitor that replicates the default algorithm
+	rootWith := makeRoot()
+	opts := VisitPayloadsOptions{Visitor: visitor}
+	opts.MapPayloadVisitor = func(ctx *VisitPayloadsContext, fields map[string]*common.Payload) error {
+		for key, payload := range fields {
+			if newPayload, err := visitPayload(ctx, &opts, ctx.Parent, payload); err != nil {
+				return err
+			} else {
+				fields[key] = newPayload
+			}
+		}
+		return nil
+	}
+	err = VisitPayloads(context.Background(), rootWith, opts)
+	require.NoError(t, err)
+
+	require.True(t, proto.Equal(rootWithout, rootWith),
+		"explicit default MapPayloadVisitor should produce identical results to implicit default")
+}
+
 func TestVisitPayloads_RepeatedPayload(t *testing.T) {
 	root := &workflowservice.CountWorkflowExecutionsResponse_AggregationGroup{GroupValues: []*common.Payload{{Data: []byte("orig-val")}}}
 

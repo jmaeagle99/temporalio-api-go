@@ -55,6 +55,11 @@ type VisitPayloadsOptions struct {
 	// Will be called for each Any encountered. If not set, the default is to recurse into the Any
 	// object, unmarshal it, visit, and re-marshal it always (even if there are no changes).
 	WellKnownAnyVisitor func(*VisitPayloadsContext, *anypb.Any) error
+	// Called with the entire map of payloads for each map[string]*Payload field encountered
+	// (e.g. Memo, Header). If nil, defaults to visiting each payload individually via Visitor.
+	//
+	// NOTE: Experimental.
+	MapPayloadVisitor func(*VisitPayloadsContext, map[string]*common.Payload) error
 }
 
 // VisitPayloads calls the options.Visitor function for every Payload proto within msg.
@@ -220,6 +225,17 @@ func (o *VisitFailuresOptions) defaultWellKnownAnyVisitor(ctx *VisitFailuresCont
 	return nil
 }
 
+func (o *VisitPayloadsOptions) defaultMapPayloadVisitor(ctx *VisitPayloadsContext, m map[string]*common.Payload) error {
+	for key, payload := range m {
+		if newPayload, err := visitPayload(ctx, o, ctx.Parent, payload); err != nil {
+			return err
+		} else {
+			m[key] = newPayload
+		}
+	}
+	return nil
+}
+
 func (o *VisitPayloadsOptions) defaultWellKnownAnyVisitor(ctx *VisitPayloadsContext, p *anypb.Any) error {
 	child, err := p.UnmarshalNew()
 	if err != nil {
@@ -270,13 +286,15 @@ func visitPayloads(
 
 		switch o := obj.(type) {
 			case map[string]*common.Payload:
-				for ix, x := range o {
-					if nx, err := visitPayload(ctx, options, parent, x); err != nil {
-						return err
-					} else {
-						o[ix] = nx
-					}
+				visitor := options.MapPayloadVisitor
+				if visitor == nil {
+					visitor = options.defaultMapPayloadVisitor
 				}
+				ctx.Parent = parent
+				if err := visitor(ctx, o); err != nil {
+					return err
+				}
+				ctx.Parent = nil
 			case *common.Payloads:
 				if o == nil { continue }
 				ctx.Parent = parent
